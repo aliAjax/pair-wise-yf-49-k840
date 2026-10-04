@@ -36,4 +36,20 @@ export interface SessionState {
   currentEvidenceId: string | null;
   timerSeconds: number;
   operatorMode: "庭审控制" | "公开屏预览";
+  /** 异议提出后冻结计时，公开屏展示暂停 */
+  timerFrozen: boolean;
+  /** 冻结时的剩余秒数，驳回后从这里继续 */
+  frozenRemaining: number | null;
+  /** 被冻结的证据，裁定时据此恢复或退出公开屏 */
+  frozenEvidenceId: string | null;
+}
+
+/** 离线记录的异议，回网后按修订号合并进庭审记录 */
+export interface PendingSyncItem {
+  objectionId: string;
+  /** 记录异议时本地所知的庭审记录修订号 */
+  baseRevision: number;
+  attempts: number;
+  lastError: string | null;
+  status: "待同步" | "同步失败";
 }
