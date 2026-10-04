@@ -1,19 +1,75 @@
-import { useEffect, useMemo, useState } from "react";
-import { Button, Card, Form, Input, Message, Modal, Radio, Select, Space, Statistic, Switch, Tag, Timeline } from "@arco-design/web-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Alert, Button, Card, Form, Input, Message, Modal, Radio, Select, Space, Statistic, Switch, Tag, Timeline } from "@arco-design/web-react";
 import { useForm, Controller } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { useTranslation } from "react-i18next";
 import { NavLink, Route, Routes } from "react-router-dom";
-import { useSaveEvidenceMutation, useGetEvidenceQuery } from "./store/api";
+import { useLoadStateQuery, useSaveStateMutation, useMergeTrialRecordMutation } from "./store/api";
 import { useAppDispatch, useAppSelector } from "./store/hooks";
-import { addObjection, completeEvidence, initialize, reorder, resolveObjection, restore, selectEvidence, setMode, setOnline, setPhase, showEvidence, snapshot, tick, toggleSensitive } from "./store/courtSlice";
-import type { Evidence, Party, SessionPhase } from "./types";
+import {
+  addObjection, completeEvidence, hydrate, mergeFailed, mergeStarted, mergeSucceeded,
+  reorder, resolveObjection, restore, selectEvidence, setForceMergeFailure, setMode,
+  setOnline, setPhase, showEvidence, snapshot, tick, toggleSensitive
+} from "./store/courtSlice";
+import type { Objection, SessionPhase } from "./types";
 
 const objectionSchema = z.object({ ground: z.string().min(2), explanation: z.string().min(6) });
 type ObjectionForm = z.infer<typeof objectionSchema>;
 
 function formatTime(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
+
+function useSyncMerge() {
+  const dispatch = useAppDispatch();
+  const state = useAppSelector((root) => root.court);
+  const [merge, { isLoading: merging }] = useMergeTrialRecordMutation();
+  const pending = state.objections.filter((item) => item.syncStatus === "pending" || item.syncStatus === "failed");
+
+  const doMerge = async () => {
+    if (!pending.length) return;
+    dispatch(mergeStarted());
+    const result = await merge({ objections: pending, baseRevision: state.recordRevision, forceFailure: state.forceMergeFailure });
+    if ("data" in result && result.data) {
+      dispatch(mergeSucceeded({ revision: result.data.revision }));
+      Message.success(`已按修订号 ${result.data.revision} 合并 ${result.data.mergedIds.length} 条异议`);
+    } else {
+      const err = "error" in result ? (result.error as { data?: { message?: string } }) : null;
+      const message = err?.data?.message ?? "合并失败，请重试";
+      dispatch(mergeFailed(message));
+      Message.error(message);
+    }
+  };
+
+  return { pending, doMerge, merging };
+}
+
+function SyncPanel() {
+  const state = useAppSelector((root) => root.court);
+  const dispatch = useAppDispatch();
+  const { pending, doMerge, merging } = useSyncMerge();
+  const pendingCount = state.objections.filter((item) => item.syncStatus === "pending").length;
+  const failedCount = state.objections.filter((item) => item.syncStatus === "failed").length;
+  const syncedCount = state.objections.filter((item) => item.syncStatus === "synced").length;
+
+  return (
+    <Card title="离线异议合并" extra={<Tag color={state.online ? "green" : "red"}>{state.online ? "在线" : "离线"}</Tag>}>
+      <Space direction="vertical" style={{ width: "100%" }} size="small">
+        <div>当前修订号：<b>{state.recordRevision}</b></div>
+        <Space wrap>
+          <span>待同步 <Tag color="orange">{pendingCount}</Tag></span>
+          <span>合并失败 <Tag color="red">{failedCount}</Tag></span>
+          <span>已入卷 <Tag color="green">{syncedCount}</Tag></span>
+        </Space>
+        {state.mergeStatus === "failed" && <Alert type="error" content={state.mergeError} />}
+        <Space>
+          <Button type="primary" onClick={() => void doMerge()} loading={merging} disabled={!state.online || !pending.length}>合并到庭审记录</Button>
+          {state.mergeStatus === "failed" && <Button onClick={() => void doMerge()} loading={merging}>重试</Button>}
+        </Space>
+        <div className="force-failure"><Switch size="small" checked={state.forceMergeFailure} onChange={(value) => dispatch(setForceMergeFailure(value))} /> 模拟合并失败（演示重试）</div>
+      </Space>
+    </Card>
+  );
+}
 
 function CourtControl() {
   const dispatch = useAppDispatch();
@@ -25,7 +81,7 @@ function CourtControl() {
   const { control, handleSubmit, reset } = useForm<ObjectionForm>({ resolver: zodResolver(objectionSchema), defaultValues: { ground: "关联性异议", explanation: "" } });
 
   useEffect(() => { const timer = window.setInterval(() => dispatch(tick()), 1000); return () => window.clearInterval(timer); }, [dispatch]);
-  const submitObjection = (values: ObjectionForm) => { if (!current) return; dispatch(addObjection({ evidenceId: current.id, ...values })); reset(); setObjectionOpen(false); Message.warning("异议已进入待裁定分支"); };
+  const submitObjection = (values: ObjectionForm) => { if (!current) return; dispatch(addObjection({ evidenceId: current.id, ...values })); reset(); setObjectionOpen(false); Message.warning("异议已进入待裁定分支，剩余时长已冻结"); };
 
   return <div className="court-grid">
     <Card className="operator" title="证据操作台" extra={<Space><Tag color={state.online ? "green" : "red"}>{state.online ? "本地审计在线" : "离线恢复模式"}</Tag><Button size="small" onClick={() => dispatch(snapshot("手动存档"))}>保存快照</Button></Space>}>
@@ -36,9 +92,10 @@ function CourtControl() {
     </Card>
     <div className="side-stack">
       <Card title="公开屏预览" extra={<Select size="small" value={mode} onChange={(value) => { setLocalMode(value as "控制" | "预览"); dispatch(setMode(value === "预览" ? "公开屏预览" : "庭审控制")); }} options={[{value:"控制",label:"控制者视图"},{value:"预览",label:"公开屏"}]} />} className="preview-card">
-        <div className="public-screen">{mode === "预览" ? <><small>公开展示</small><h2>{current?.exhibitNo ?? "暂无证据"}</h2><h3>{current?.title ?? "庭审进行中"}</h3>{current?.sensitive ? <div className="redaction"><b>敏感内容已遮罩</b><p>该证据包含不适宜公开的信息，庭审结束后统一入卷。</p></div> : <p>{current?.note}</p>}<footer>计时 {formatTime(state.session.timerSeconds)} · {state.session.phase}</footer></> : <><small>控制者私有视图</small><h2>敏感内容可预览</h2><p>{current?.sensitive ? "此证据将在公开屏遮罩客户名称，控制者可查看完整备注。" : "当前证据可完整公开。"}</p><Tag color="red">操作端专属</Tag></>}</div>
+        <div className="public-screen">{mode === "预览" ? <><small>公开展示</small><h2>{current?.exhibitNo ?? "暂无证据"}</h2><h3>{current?.title ?? "庭审进行中"}</h3>{current?.sensitive ? <div className="redaction"><b>敏感内容已遮罩</b><p>该证据包含不适宜公开的信息，庭审结束后统一入卷。</p></div> : <p>{current?.note}</p>}{state.session.paused && <div className="freeze-banner"><b>异议待裁定 · 剩余时长已冻结</b><span>冻结于 {formatTime(state.objections.find((o) => o.evidenceId === current?.id && o.status === "待裁定")?.frozenRemainingSeconds ?? state.session.timerSeconds)}</span></div>}<footer>计时 {formatTime(state.session.timerSeconds)} · {state.session.phase}{state.session.paused ? " · 已冻结" : ""}</footer></> : <><small>控制者私有视图</small><h2>敏感内容可预览</h2><p>{current?.sensitive ? "此证据将在公开屏遮罩客户名称，控制者可查看完整备注。" : "当前证据可完整公开。"}</p><Tag color="red">操作端专属</Tag></>}</div>
       </Card>
-      <Card title="待审异议" extra={<Tag color="red">{pending.length}</Tag>}>{pending.map((item) => <div className="objection" key={item.id}><b>{item.ground}</b><p>{item.explanation}</p><Space><Button size="mini" status="success" onClick={() => dispatch(resolveObjection({ id: item.id, status: "支持" }))}>支持并跳过</Button><Button size="mini" onClick={() => dispatch(resolveObjection({ id: item.id, status: "驳回" }))}>驳回继续</Button></Space></div>)}{!pending.length && <p>当前没有待裁定异议。</p>}</Card>
+      <Card title="待审异议" extra={<Tag color="red">{pending.length}</Tag>}>{pending.map((item) => <div className="objection" key={item.id}><b>{item.ground}</b><p>{item.explanation}</p>{item.frozenRemainingSeconds > 0 && <Tag color="orange">剩余时长冻结于 {formatTime(item.frozenRemainingSeconds)}</Tag>}<Space><Button size="mini" status="success" onClick={() => dispatch(resolveObjection({ id: item.id, status: "支持" }))}>支持并跳过</Button><Button size="mini" onClick={() => dispatch(resolveObjection({ id: item.id, status: "驳回" }))}>驳回继续</Button></Space></div>)}{!pending.length && <p>当前没有待裁定异议。</p>}</Card>
+      <SyncPanel />
     </div>
     <Modal title="提出证据异议" visible={objectionOpen} onCancel={() => setObjectionOpen(false)} onOk={() => handleSubmit(submitObjection)()}><Form layout="vertical"><Form.Item label="异议类型"><Controller name="ground" control={control} render={({ field }) => <Select {...field} options={[{value:"关联性异议",label:"关联性异议"},{value:"真实性异议",label:"真实性异议"},{value:"合法性异议",label:"合法性异议"}]} />} /></Form.Item><Form.Item label="异议说明"><Controller name="explanation" control={control} render={({ field }) => <Input.TextArea {...field} placeholder="说明异议依据和希望法庭裁定的事项" />} /></Form.Item></Form></Modal>
     <Card title="庭审阶段" className="phase-card"><Radio.Group value={state.session.phase} onChange={(value) => dispatch(setPhase(value as SessionPhase))}><Radio value="开庭">开庭</Radio><Radio value="举证">举证</Radio><Radio value="质证">质证</Radio><Radio value="休庭">休庭</Radio><Radio value="结束">结束</Radio></Radio.Group></Card>
@@ -60,11 +117,19 @@ function EvidencePage() {
 export default function App() {
   const dispatch = useAppDispatch();
   const state = useAppSelector((root) => root.court);
-  const { data = [] } = useGetEvidenceQuery();
-  const [save] = useSaveEvidenceMutation();
+  const { data: saved } = useLoadStateQuery();
+  const [saveState] = useSaveStateMutation();
+  const { pending, doMerge } = useSyncMerge();
   const { t, i18n } = useTranslation();
-  useEffect(() => { if (data.length) dispatch(initialize(data)); }, [data, dispatch]);
-  useEffect(() => { const timer = window.setTimeout(() => void save(state.evidence), 300); return () => window.clearTimeout(timer); }, [state.evidence, save]);
+  const wasOnline = useRef(state.online);
+
+  useEffect(() => { if (saved) dispatch(hydrate(saved)); }, [saved, dispatch]);
+  useEffect(() => { const timer = window.setTimeout(() => void saveState(state), 600); return () => window.clearTimeout(timer); }, [state, saveState]);
+  // 回网后自动按修订号合并离线异议
+  useEffect(() => {
+    if (!wasOnline.current && state.online && pending.length) void doMerge();
+    wasOnline.current = state.online;
+  });
   const metrics = useMemo(() => ({ shown: state.evidence.filter((item) => item.status === "已展示").length, sensitive: state.evidence.filter((item) => item.sensitive).length, objections: state.objections.length }), [state]);
   return <div className="shell"><aside><div className="brand"><b>COURT</b><span>庭审控制</span></div><nav><NavLink to="/">{t("control")}</NavLink><NavLink to="/evidence">证据目录</NavLink><NavLink to="/timeline">{t("timeline")}</NavLink></nav><Button onClick={() => void i18n.changeLanguage(i18n.language === "zh" ? "en" : "zh")}>{i18n.language === "zh" ? "EN" : "中文"}</Button></aside><main><header><div><small>案件号 2026-民初-1084 · 全流程审计开启</small><h1>{t("title")}</h1></div><div className="top-tools"><label>本地恢复 <Switch checked={!state.online} onChange={(value) => dispatch(setOnline(!value))} /></label><Tag color={state.online ? "green" : "orange"}>{state.online ? "协作同步" : "离线操作"}</Tag></div></header><section className="metrics"><Card><Statistic title="证据总数" value={state.evidence.length} /></Card><Card><Statistic title="已完成质证" value={metrics.shown} /></Card><Card><Statistic title="敏感证据" value={metrics.sensitive} /></Card><Card><Statistic title="异议记录" value={metrics.objections} /></Card></section><Routes><Route path="/" element={<CourtControl />} /><Route path="/evidence" element={<EvidencePage />} /><Route path="/timeline" element={<TimelinePage />} /></Routes></main></div>;
 }
